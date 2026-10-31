@@ -84,19 +84,91 @@
   if ('speechSynthesis' in window) { loadVoices(); speechSynthesis.onvoiceschanged = loadVoices; }
 
   var audioEl = null, audioTimer = null;
-  var pre = { word: '', el: null };
+  var audioCache = {}, audioOrder = [];
 
-  function audioUrl(text) { return 'https://dict.youdao.com/dictvoice?le=ko&audio=' + encodeURIComponent(text); }
+  /* 单词用有道（音质好），整句用百度（有道对带空格/标点的句子会 500） */
+  function audioUrls(text) {
+    var baidu = 'https://fanyi.baidu.com/gettts?lan=kor&spd=3&source=web&text=' + encodeURIComponent(text);
+    var youdao = 'https://dict.youdao.com/dictvoice?le=ko&audio=' + encodeURIComponent(text);
+    return text.indexOf(' ') > -1 ? [baidu, youdao] : [youdao, baidu];
+  }
 
-  /* 卡片出现时先静默下载音频，点喇叭就能立刻出声 */
-  function preloadAudio(text) {
-    if (!text || pre.word === text) return;
+  function getAudio(text) {
+    var a = audioCache[text];
+    if (a) return a;
     try {
-      pre.el = new Audio(audioUrl(text));
-      pre.el.preload = 'auto';
-      pre.el.load();
-      pre.word = text;
-    } catch (e) {}
+      var urls = audioUrls(text);
+      a = new Audio(urls[0]);
+      a.preload = 'auto';
+      a._urls = urls; a._i = 0;
+      a.load();
+      audioCache[text] = a;
+      audioOrder.push(text);
+      if (audioOrder.length > 8) {
+        var old = audioOrder.shift();
+        if (old !== text) delete audioCache[old];
+      }
+      return a;
+    } catch (e) { return null; }
+  }
+
+  /* 卡片出现时先把音频静默下好，点喇叭就能立刻出声 */
+  function preloadAudio(text) { if (text) getAudio(text); }
+
+  function setLoading(btn, on) { if (btn) btn.classList.toggle('loading', !!on); }
+
+  /* 例句音频：644 句打包成一个文件，点的时候按字节切出来，秒播、可离线 */
+  var SENT = { buf: null, req: null, failed: false, base: '' };
+
+  function sentBinUrl() {
+    if (SENT.base) return SENT.base + 'audio/sentences.bin';
+    var s = document.querySelector('script[src$="sentences-index.js"]');
+    if (s && s.src) {
+      var m = s.src.match(/^(.*?)js\/sentences-index\.js/);
+      if (m) { SENT.base = m[1]; return SENT.base + 'audio/sentences.bin'; }
+    }
+    return 'audio/sentences.bin';
+  }
+
+  function ensureSentences(cb) {
+    if (SENT.buf) return cb(true);
+    if (SENT.failed) return cb(false);
+    if (SENT.req) { SENT.req.push(cb); return; }
+    SENT.req = [cb];
+    fetch(sentBinUrl()).then(function (r) {
+      if (!r.ok) throw new Error('http ' + r.status);
+      return r.arrayBuffer();
+    }).then(function (b) {
+      SENT.buf = b;
+      var q = SENT.req; SENT.req = null;
+      q.forEach(function (f) { f(true); });
+    }).catch(function () {
+      SENT.failed = true;
+      var q = SENT.req; SENT.req = null;
+      q.forEach(function (f) { f(false); });
+    });
+  }
+
+  function playSentence(ko, btn) {
+    var w = MAP[ko];
+    var idx = window.KV_SENT || {};
+    var e = w && w.ex && idx[ko];
+    if (!e) { if (w && w.ex) speakLocal(w.ex, btn); return; }
+    if (btn) { btn.classList.add('playing'); setLoading(btn, !SENT.buf); }
+    ensureSentences(function (ok) {
+      if (btn) setLoading(btn, false);
+      if (!ok) { if (btn) btn.classList.remove('playing'); speakLocal(w.ex, btn); return; }
+      try {
+        var blob = new Blob([SENT.buf.slice(e[0], e[0] + e[1])], { type: 'audio/mpeg' });
+        var url = URL.createObjectURL(blob);
+        var a = new Audio(url);
+        a.onended = a.onerror = function () {
+          URL.revokeObjectURL(url);
+          if (btn) btn.classList.remove('playing');
+        };
+        a.play();
+      } catch (err) { if (btn) btn.classList.remove('playing'); speakLocal(w.ex, btn); }
+    });
   }
 
   function speakLocal(text, btn) {
@@ -113,30 +185,47 @@
     } catch (e) { if (btn) btn.classList.remove('playing'); toast('发音加载失败，请检查网络'); }
   }
 
-  /* 优先用在线韩语语音（有道），失败再退回系统朗读 */
+  /* 播放：当前音源失败就换下一个，最终退回系统朗读 */
   function playAudio(text, btn) {
-    if (btn) btn.classList.add('playing');
-    var stop = function () { if (btn) btn.classList.remove('playing'); };
+    var a = getAudio(text);
+    if (!a) { speakLocal(text, btn); return; }
+    if (btn) { btn.classList.add('playing'); setLoading(btn, a.readyState < 3); }
+    var done = function () { if (btn) { btn.classList.remove('playing'); setLoading(btn, false); } };
     var fell = false;
     var fallback = function () {
       if (fell) return;
       fell = true;
       clearTimeout(audioTimer);
-      stop();
+      done();
       speakLocal(text, btn);
     };
+    var nextSrc = function () {
+      if (a._i < a._urls.length - 1) {
+        a._i++;
+        a.src = a._urls[a._i];
+        a.onerror = nextSrc;
+        try { a.load(); } catch (e) {}
+        var p = a.play();
+        if (p && p.catch) p.catch(nextSrc);
+      } else {
+        fallback();
+      }
+    };
     try {
-      if (audioEl) { audioEl.onerror = null; audioEl.pause(); audioEl = null; }
-      audioEl = (pre.word === text && pre.el) ? pre.el : new Audio(audioUrl(text));
-      if (audioEl.currentTime) audioEl.currentTime = 0;
-      audioEl.onended = stop;
-      audioEl.onerror = fallback;
-      var p = audioEl.play();
-      if (p && p.catch) p.catch(fallback);
+      if (audioEl && audioEl !== a) { audioEl.onerror = null; audioEl.pause(); }
+      audioEl = a;
+      try { a.currentTime = 0; } catch (e) {}
+      a.onended = done;
+      a.onplaying = function () { setLoading(btn, false); };
+      a.oncanplay = function () { if (!a.paused) setLoading(btn, false); };
+      a.onerror = nextSrc;
+      var p = a.play();
+      if (p && p.catch) p.catch(nextSrc);
+      clearTimeout(audioTimer);
       audioTimer = setTimeout(function () {
-        if (!fell && audioEl && audioEl.readyState < 3) fallback();
-      }, 2500);
-    } catch (e) { fallback(); }
+        if (!fell && a.readyState < 3) nextSrc();
+      }, 3000);
+    } catch (e) { nextSrc(); }
   }
 
   /* ---------------- 学习数据 ---------------- */
@@ -257,6 +346,7 @@
     haptic();
     renderQuiz();
     if (S.settings.autoSpeak) setTimeout(function () { playAudio(w.ko); }, 120);
+    if (!SENT.buf) setTimeout(function () { ensureSentences(function () {}); }, 1500);
     requestAnimationFrame(function () {
       var d = $('.detail');
       if (d) d.scrollIntoView({ block: 'center', behavior: 'smooth' });
@@ -282,7 +372,8 @@
     arrow: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>',
     flame: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3s5 4.5 5 9a5 5 0 0 1-10 0c0-1.6.8-3 1.5-3.8C8 10 9 11 9.5 12c0-3 1-6 2.5-9Z"/></svg>',
     down: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>',
-    book: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 6c-2-1.5-5-2-8-2v14c3 0 6 .5 8 2 2-1.5 5-2 8-2V4c-3 0-6 .5-8 2Z"/><path d="M12 6v14"/></svg>'
+    book: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 6c-2-1.5-5-2-8-2v14c3 0 6 .5 8 2 2-1.5 5-2 8-2V4c-3 0-6 .5-8 2Z"/><path d="M12 6v14"/></svg>',
+    search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></svg>'
   };
 
   /* ---------------- 导航 ---------------- */
@@ -290,6 +381,7 @@
     var due = dueList().length;
     return '<nav class="nav">' +
       '<button data-act="nav" data-v="home" class="' + (active === 'home' ? 'on' : '') + '">' + IC.learn + (due ? '<i class="dot"></i>' : '') + '<span>学习</span></button>' +
+      '<button data-act="nav" data-v="dict" class="' + (active === 'dict' ? 'on' : '') + '">' + IC.book + '<span>词典</span></button>' +
       '<button data-act="nav" data-v="grammar" class="' + (active === 'grammar' ? 'on' : '') + '">' + IC.gram + '<span>语法</span></button>' +
       '<button data-act="nav" data-v="stats" class="' + (active === 'stats' ? 'on' : '') + '">' + IC.chart + '<span>我的</span></button>' +
       '</nav>';
@@ -421,7 +513,7 @@
         pronRow +
         (w.note ? '<div class="drow"><div class="dtag">用法</div><div class="dbody"><p>' + esc(w.note) + '</p></div></div>' : '') +
         (w.ety ? '<div class="drow"><div class="dtag">构词</div><div class="dbody"><p>' + esc(w.ety) + '</p></div></div>' : '') +
-        (w.ex ? '<div class="drow"><div class="dtag">例句</div><div class="dbody"><div class="ex"><span class="say" data-act="speak" data-v="' + esc(w.ex) + '">' + IC.speaker + '</span><span>' + esc(w.ex) + '</span></div><p class="ex-zh">' + esc(w.exZh) + '</p></div></div>' : '') +
+        (w.ex ? '<div class="drow"><div class="dtag">例句</div><div class="dbody"><div class="ex"><span class="say" data-act="sayex" data-v="' + esc(w.ko) + '">' + IC.speaker + '</span><span>' + esc(w.ex) + '</span></div><p class="ex-zh">' + esc(w.exZh) + '</p></div></div>' : '') +
         gramRow +
         '</div>' +
         '<div class="dactions"><button class="btn primary" data-act="next">' + (Q.i + 1 >= Q.queue.length ? '完成学习' : '下一个') + ' ' + IC.arrow + '</button></div>' +
@@ -475,6 +567,106 @@
       '</div>' +
       '<p class="footnote">记忆需要重复。明天见 👋</p>' +
       '</div>' + nav('home');
+  }
+
+  /* ---------------- 词典 ---------------- */
+  var DICT = { q: '', level: 0, status: 'all', limit: 60 };
+
+  function dictFiltered() {
+    var t = today(), q = DICT.q.trim().toLowerCase();
+    return WORDS.filter(function (w) {
+      if (DICT.level && w.level !== DICT.level) return false;
+      var p = S.words[w.ko];
+      if (DICT.status === 'today') { if (!p || p.f !== t) return false; }
+      else if (DICT.status === 'new') { if (p) return false; }
+      else if (DICT.status === 'wrong') { if (!p || !p.w) return false; }
+      if (q && w.ko.indexOf(q) < 0 && w.zh.toLowerCase().indexOf(q) < 0) return false;
+      return true;
+    });
+  }
+
+  function dictRows(list) {
+    if (!list.length) return '<div class="empty" style="padding:36px 16px">没有符合条件的单词</div>';
+    return list.map(function (w) {
+      var p = S.words[w.ko];
+      var cls = !p ? 'new' : (p.s >= 5 ? 'ok' : 'prog');
+      var label = !p ? '未学' : (p.s >= 5 ? '已掌握' : '学习中');
+      return '<button class="drow2" data-act="word" data-v="' + esc(w.ko) + '">' +
+        '<span class="we">' + emojiFor(w) + '</span>' +
+        '<span class="wm"><b>' + esc(w.ko) + '</b><small>' + esc(w.zh) + '</small></span>' +
+        (p && p.w ? '<i class="wd">错' + p.w + '</i>' : '') +
+        '<span class="ws ' + cls + '">' + label + '</span></button>';
+    }).join('');
+  }
+
+  function dictCountText(n) {
+    return '共 ' + WORDS.length + ' 词 · 当前 ' + n + ' 个 · 已学 ' + Object.keys(S.words).length;
+  }
+
+  function renderDict() {
+    var list = dictFiltered();
+    var statusChips = [['all', '全部'], ['today', '今天学的'], ['new', '未学'], ['wrong', '错词']].map(function (x) {
+      return '<button class="chip' + (DICT.status === x[0] ? ' on' : '') + '" data-act="dictstatus" data-v="' + x[0] + '">' + x[1] + '</button>';
+    }).join('');
+    var lvChips = [[0, '全部级别']].concat([1, 2, 3, 4, 5, 6].map(function (n) { return [n, n + '급']; })).map(function (x) {
+      return '<button class="chip' + (DICT.level === x[0] ? ' on' : '') + '" data-act="dictlevel" data-v="' + x[0] + '">' + x[1] + '</button>';
+    }).join('');
+    app.innerHTML = '<div class="screen active">' +
+      '<div class="topbar"><div><div class="hi">단어장</div><h1>词典</h1></div>' +
+      '<div class="streak">' + WORDS.length + ' 词</div></div>' +
+      '<div class="searchbar">' + IC.search + '<input id="dictSearch" type="search" enterkeyhint="search" placeholder="搜韩语或中文，例如 사과 / 苹果" value="' + esc(DICT.q) + '"></div>' +
+      '<div class="filters">' + statusChips + '</div>' +
+      '<div class="filters">' + lvChips + '</div>' +
+      '<div class="dict-meta" id="dictCount">' + dictCountText(list.length) + '</div>' +
+      '<div class="card" style="padding:2px 14px" id="dictList">' + dictRows(list.slice(0, DICT.limit)) + '</div>' +
+      '<button class="btn ghost" id="dictMore" style="width:100%;margin-top:12px;' + (list.length > DICT.limit ? '' : 'display:none') + '" data-act="dictmore">加载更多</button>' +
+      '<p class="footnote">点任意单词可看释义、发音、构词和复习状态</p>' +
+      '</div>' + nav('dict');
+  }
+
+  function updateDictList() {
+    var list = dictFiltered();
+    var el = document.getElementById('dictList');
+    if (el) el.innerHTML = dictRows(list.slice(0, DICT.limit));
+    var c = document.getElementById('dictCount');
+    if (c) c.textContent = dictCountText(list.length);
+    var more = document.getElementById('dictMore');
+    if (more) {
+      if (list.length > DICT.limit) { more.style.display = ''; more.textContent = '加载更多（还有 ' + (list.length - DICT.limit) + ' 个）'; }
+      else more.style.display = 'none';
+    }
+  }
+
+  function openWord(ko) {
+    var w = MAP[ko];
+    if (!w) return;
+    var p = S.words[ko];
+    var pinfo = pronFor(w);
+    var status = !p ? '还没学过' : (p.s >= 5 ? '已掌握' : '学习中');
+    var next = p ? ' · 下次复习：' + fmtDate(p.d) : '';
+    var rows = '';
+    if (w.ety) rows += '<div class="drow"><div class="dtag">构词</div><div class="dbody"><p>' + esc(w.ety) + '</p></div></div>';
+    if (w.note) rows += '<div class="drow"><div class="dtag">用法</div><div class="dbody"><p>' + esc(w.note) + '</p></div></div>';
+    if (w.ex) rows += '<div class="drow"><div class="dtag">例句</div><div class="dbody"><div class="ex"><span class="say" data-act="sayex" data-v="' + esc(w.ko) + '">' + IC.speaker + '</span><span>' + esc(w.ex) + '</span></div><p class="ex-zh">' + esc(w.exZh) + '</p></div></div>';
+    rows += '<div class="drow"><div class="dtag">状态</div><div class="dbody"><p>' + status + next + '</p></div></div>';
+
+    document.querySelectorAll('.modal').forEach(function (x) { x.remove(); });
+    var m = document.createElement('div');
+    m.className = 'modal';
+    m.innerHTML = '<div class="panel">' +
+      '<div class="sheet-head"><span class="badge lv' + w.level + '">TOPIK ' + w.level + '급</span><button class="icon-btn" data-act="closemodal">' + IC.x + '</button></div>' +
+      '<div class="d-mean" style="border:0;padding:12px 0 8px"><span class="d-emoji" style="font-size:38px">' + emojiFor(w) + '</span>' +
+      '<div class="d-mean-tx"><b style="font-size:27px">' + esc(w.ko) + '</b><span style="font-size:14px;color:var(--ink2)">' + esc(w.zh) + '</span></div>' +
+      '<button class="d-say" data-act="speak" data-v="' + esc(w.ko) + '">' + IC.speaker + '</button></div>' +
+      (pinfo ? '<button class="d-pron" data-act="pron" data-v="' + esc(w.ko) + '">발음 <b>' + esc(pinfo.text) + '</b>' +
+        pinfo.rules.slice(0, 2).map(function (r) { return '<span class="pr-tag">' + esc(r) + '</span>'; }).join('') +
+        '<span class="pr-arrow">规则 ›</span></button>' : '') +
+      rows +
+      '</div>';
+    document.body.appendChild(m);
+    m.addEventListener('click', function (e) {
+      if (e.target === m || e.target.closest('[data-act="closemodal"]')) m.remove();
+    });
   }
 
   /* ---------------- 语法 ---------------- */
@@ -652,6 +844,10 @@
       return '<button class="' + (S.settings.levels.indexOf(n) > -1 ? 'on' : '') + '" data-act="lvl" data-v="' + n + '">' + n + '급</button>';
     }).join('');
 
+    var tday = today(), tw = [];
+    for (var kt in S.words) if (S.words[kt].f === tday) tw.push(kt);
+    tw.sort(function (a, b) { return (S.words[b].t || 0) - (S.words[a].t || 0); });
+
     app.innerHTML = '<div class="screen active">' +
       '<div class="topbar"><div><div class="hi">나의 기록</div><h1>学习记录</h1></div>' +
       '<div class="streak">' + IC.flame + '<b>' + (S.streak.n || 0) + '</b>天</div></div>' +
@@ -660,6 +856,17 @@
       '<div class="stat"><span class="lab">已掌握</span><b>' + mastered + '<small>词</small></b></div>' +
       '<div class="stat"><span class="lab">总正确率</span><b>' + acc + '<small>%</small></b></div>' +
       '<div class="stat"><span class="lab">最长连续</span><b>' + (S.streak.best || 0) + '<small>天</small></b></div>' +
+      '</div>' +
+      '<div class="sec"><div class="sec-head"><h2>今天学的词</h2><span>' + tw.length + ' 个</span></div>' +
+      '<div class="card">' + (tw.length
+        ? '<div class="wlist">' + tw.slice(0, 6).map(function (k) {
+            var w = MAP[k];
+            if (!w) return '';
+            return '<div class="wrow"><span class="ko">' + esc(w.ko) + '</span><span class="zh">' + esc(w.zh) + '</span>' +
+              '<button class="say" data-act="speak" data-v="' + esc(w.ko) + '">' + IC.speaker + '</button></div>';
+          }).join('') + '</div>'
+        : '<div class="empty">今天还没开始，去学几个词吧</div>') + '</div>' +
+      (tw.length ? '<button class="linkish" data-act="dicttoday" style="margin-top:10px">在词典里查看今天学的 ' + tw.length + ' 个词 →</button>' : '') +
       '</div>' +
       '<div class="sec"><div class="sec-head"><h2>最近 7 天</h2><span>新词 / 复习</span></div>' +
       '<div class="card">' + chart + '</div></div>' +
@@ -690,12 +897,18 @@
     switch (act) {
       case 'nav': {
         if (v === 'home') renderHome();
+        else if (v === 'dict') renderDict();
         else if (v === 'grammar') renderGrammar();
         else renderStats();
         window.scrollTo(0, 0);
         break;
       }
       case 'start': startSession(); break;
+      case 'dictstatus': DICT.status = v; DICT.limit = 60; renderDict(); window.scrollTo(0, 0); break;
+      case 'dictlevel': DICT.level = parseInt(v, 10); DICT.limit = 60; renderDict(); window.scrollTo(0, 0); break;
+      case 'dictmore': DICT.limit += 60; updateDictList(); break;
+      case 'dicttoday': DICT.status = 'today'; DICT.level = 0; DICT.q = ''; DICT.limit = 60; renderDict(); window.scrollTo(0, 0); break;
+      case 'word': openWord(v); break;
       case 'quit': {
         if (Q && (Q.ok + Q.bad) > 0) {
           if (!confirm('退出本次学习？已答的题目会保存进度。')) return;
@@ -706,6 +919,7 @@
       case 'skip': answer(-1); break;
       case 'next': nextCard(false); break;
       case 'speak': playAudio(v, t); break;
+      case 'sayex': playSentence(v, t); break;
       case 'gram': openGram(v); break;
       case 'pron': openPron(v); break;
       case 'pronall': openPron(null); break;
@@ -765,6 +979,14 @@
     }
   });
 
+  document.addEventListener('input', function (e) {
+    if (e.target && e.target.id === 'dictSearch') {
+      DICT.q = e.target.value;
+      DICT.limit = 60;
+      updateDictList();
+    }
+  });
+
   document.addEventListener('keydown', function (e) {
     if (!Q || !Q.answered) {
       if (Q && !Q.answered && ['1', '2', '3', '4'].indexOf(e.key) > -1) { answer(parseInt(e.key, 10) - 1); }
@@ -779,6 +1001,7 @@
     words: WORDS, grammar: GRAM,
     start: startSession, answer: answer, next: function () { nextCard(false); },
     home: renderHome, stats: renderStats, grammarView: renderGrammar,
+    dict: renderDict, word: openWord,
     summary: function (b) { renderSummary(b || { ok: 14, bad: 2, acc: 88, totalNew: 12, totalRev: 4 }); },
     state: function () { return S; },
     session: function () { return Q; },
